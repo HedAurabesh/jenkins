@@ -30,12 +30,18 @@ import java.util.Collection;
 import java.util.AbstractCollection;
 import java.util.Iterator;
 import java.util.concurrent.CopyOnWriteArraySet;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * Controls mutual exclusion of {@link ResourceList}.
  * @author Kohsuke Kawaguchi
  */
 public class ResourceController {
+    /**
+     * This is the lock that governs access to all contested fields in this class
+     */
+    private final ReentrantReadWriteLock qLock = new ReentrantReadWriteLock();
+    
     /**
      * {@link ResourceList}s that are used by activities that are in progress.
      */
@@ -75,22 +81,29 @@ public class ResourceController {
      */
     public void execute( Runnable task, ResourceActivity activity ) throws InterruptedException {
         ResourceList resources = activity.getResourceList();
-        synchronized(this) {
+        qLock.writeLock().lock();
+        try {
             while(inUse.isCollidingWith(resources))
                 wait();
 
             // we have a go
             inProgress.add(activity);
             inUse = ResourceList.union(inUse,resources);
+        } finally {
+            qLock.writeLock().unlock();
         }
 
         try {
             task.run();
         } finally {
-            synchronized(this) {
+            qLock.writeLock().lock();
+            try {
                 inProgress.remove(activity);
                 inUse = ResourceList.union(resourceView);
-                notifyAll();
+            } finally {
+                qLock.writeLock().unlock();
+                //FIXME: This synchronized action seems to be needed for some reason
+                synchronized(this) { notifyAll(); }
             }
         }
     }
@@ -104,8 +117,13 @@ public class ResourceController {
      * another activity might acquire resources before the caller
      * gets to call {@link #execute(Runnable, ResourceActivity)}.
      */
-    public synchronized boolean canRun(ResourceList resources) {
-        return !inUse.isCollidingWith(resources);
+    public boolean canRun(ResourceList resources) {
+        qLock.readLock().lock();
+        try {
+            return !inUse.isCollidingWith(resources);
+        } finally {
+            qLock.readLock().unlock();
+        }
     }
 
     /**
@@ -116,8 +134,13 @@ public class ResourceController {
      * If more than one such resource exists, one is chosen and returned.
      * This method is used for reporting what's causing the blockage.
      */
-    public synchronized Resource getMissingResource(ResourceList resources) {
-        return resources.getConflict(inUse);
+    public Resource getMissingResource(ResourceList resources) {
+        qLock.readLock().lock();
+        try {
+            return resources.getConflict(inUse);
+        } finally {
+            qLock.readLock().unlock();
+        }
     }
 
     /**
